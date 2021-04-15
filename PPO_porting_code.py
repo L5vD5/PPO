@@ -1,0 +1,186 @@
+import datetime,gym,os,pybullet_envs,psutil,time,os
+import scipy.signal
+import numpy as np
+import torch
+import torch.nn as nn
+from torch.distributions.normal import Normal
+from gym.spaces import Box, Discrete
+
+print("Pytorch version:[%s]."%(torch.__version__))
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print("device:[%s]."%(device))
+
+def combined_shape(length, shape=None):
+    if shape is None:
+        return (length,)
+    return (length, shape) if np.isscalar(shape) else (length, *shape)
+
+def statistics_scalar(x, with_min_and_max=False):
+    """
+    Get mean/std and optional min/max of scalar x
+    Args:
+        x: An array containing samples of the scalar to produce statistics for.
+        with_min_and_max (bool): If true, return min and max of x in
+            addition to mean and std.
+    """
+    x = np.array(x, dtype=np.float32)
+    global_sum, global_n = np.sum(x), len(x)
+    mean = global_sum / global_n
+    global_sum_sq = np.sum((x - mean)**2)
+    std = np.sqrt(global_sum_sq / global_n)  # compute global std
+    if with_min_and_max:
+        global_min = (np.min(x) if len(x) > 0 else np.inf)
+        global_max = (np.max(x) if len(x) > 0 else -np.inf)
+        return mean, std, global_min, global_max
+    return mean, std
+
+def discount_cumsum(x, discount):
+    """
+    Compute discounted cumulative sums of vectors.
+    input:
+        vector x, [x0, x1, x2]
+    output:
+        [x0 + discount * x1 + discount^2 * x2,
+         x1 + discount * x2,
+         x2]
+    """
+    return scipy.signal.lfilter([1], [1, float(-discount)], x[::-1], axis=0)[::-1]
+
+
+class PPOBuffer:
+    """
+    A buffer for storing trajectories experienced by a PPO agent interacting
+    with the environment, and using Generalized Advantage Estimation (GAE-Lambda)
+    for calculating the advantages of state-action pairs.
+    """
+
+    def __init__(self, odim, adim, size=5000, gamma=0.99, lam=0.95):
+        self.obs_buf = np.zeros(combined_shape(size, odim), dtype=np.float32)
+        self.act_buf = np.zeros(combined_shape(size, adim), dtype=np.float32)
+        self.adv_buf = np.zeros(size, dtype=np.float32)
+        self.rew_buf = np.zeros(size, dtype=np.float32)
+        self.ret_buf = np.zeros(size, dtype=np.float32)
+        self.val_buf = np.zeros(size, dtype=np.float32)
+        self.logp_buf = np.zeros(size, dtype=np.float32)
+        self.gamma, self.lam = gamma, lam
+        self.ptr, self.path_start_idx, self.max_size = 0, 0, size
+
+    def store(self, obs, act, rew, val, logp):
+        """
+        Append one timestep of agent-environment interaction to the buffer.
+        """
+        assert self.ptr < self.max_size  # buffer has to have room so you can store
+        self.obs_buf[self.ptr] = obs
+        self.act_buf[self.ptr] = act
+        self.rew_buf[self.ptr] = rew
+        self.val_buf[self.ptr] = val
+        self.logp_buf[self.ptr] = logp
+        self.ptr += 1
+
+    def finish_path(self, last_val=0):
+        """
+        Call this at the end of a trajectory, or when one gets cut off
+        by an epoch ending. This looks back in the buffer to where the
+        trajectory started, and uses rewards and value estimates from
+        the whole trajectory to compute advantage estimates with GAE-Lambda,
+        as well as compute the rewards-to-go for each state, to use as
+        the targets for the value function.
+
+        The "last_val" argument should be 0 if the trajectory ended
+        because the agent reached a terminal state (died), and otherwise
+        should be V(s_T), the value function estimated for the last state.
+        This allows us to bootstrap the reward-to-go calculation to account
+        for timesteps beyond the arbitrary episode horizon (or epoch cutoff).
+        """
+        path_slice = slice(self.path_start_idx, self.ptr)
+        rews = np.append(self.rew_buf[path_slice], last_val)
+        vals = np.append(self.val_buf[path_slice], last_val)
+
+        # the next two lines implement GAE-Lambda advantage calculation
+        deltas = rews[:-1] + self.gamma * vals[1:] - vals[:-1]
+        self.adv_buf[path_slice] = discount_cumsum(deltas, self.gamma * self.lam)
+
+        # the next line computes rewards-to-go, to be targets for the value function
+        self.ret_buf[path_slice] = discount_cumsum(rews, self.gamma)[:-1]
+
+        self.path_start_idx = self.ptr
+
+    def get(self):
+        """
+        Call this at the end of an epoch to get all of the data from
+        the buffer, with advantages appropriately normalized (shifted to have
+        mean zero and std one). Also, resets some pointers in the buffer.
+        """
+        assert self.ptr == self.max_size  # buffer has to be full before you can get
+        self.ptr, self.path_start_idx = 0, 0
+        # the next two lines implement the advantage normalization trick
+        adv_mean, adv_std = statistics_scalar(self.adv_buf)
+        self.adv_buf = (self.adv_buf - adv_mean) / adv_std
+        return [self.obs_buf, self.act_buf, self.adv_buf,
+                self.ret_buf, self.logp_buf]
+
+##### Model construction #####
+class MLP(nn.Module):
+    def __init__(self, o_dim=24, hdims=[64,64], actv=nn.ReLU(), output_actv=None):
+        super(MLP, self).__init__()
+
+        self.o_dim = o_dim
+        self.hdims = hdims
+        self.actv = actv
+        self.ouput_actv = output_actv
+
+        self.layers = []
+        prev_hdim = self.o_dim
+        for hdim in self.hdims[:-1]:
+            self.layers.append(nn.Linear(prev_hdim, hdim, bias=True))
+            self.layers.append(actv)
+            prev_hdim = hdim
+        self.layers.append(nn.Linear(prev_hdim, hdims[-1]))
+
+        self.net = nn.Sequential()
+        for l_idx, layer in enumerate(self.layers):
+            layer_name = "%s_%02d" % (type(layer).__name__.lower(), l_idx)
+            self.net.add_module(layer_name, layer)
+
+    def forward(self, inputs):
+        if self.ouput_actv is None:
+            x = self.net(inputs)
+        else:
+            x = self.net(inputs)
+            x = self.actv(x)
+        return x
+
+class GaussianPolicy(nn.Module):
+    def __init__(self, o, a, hdims=[64,64], actv=nn.ReLU(), output_actv=None):
+        super(GaussianPolicy, self).__init__()
+
+        self.o = o
+        self.a = a
+        self.output_actv = output_actv
+        self.a_dim = a.shape.as_list()[-1]
+        self.net = MLP(o_dim=o.shape[0], hdims=hdims, actv=actv, output_actv=output_actv)
+        self.mu = nn.Linear(in_features=hdims[-1], out_features=self.a_dim)
+        self.log_std = nn.Parameter(-0.5*torch.ones(self.a_dim))
+
+    def forward(self, x, a):
+        output = self.net(x)
+        mu = self.mu(output)
+        if self.output_actv:
+            mu = self.output_actv(mu)
+        policy = Normal(mu, self.log_std.exp())
+        pi = policy.sample()
+        logp_pi = policy.log_prob(pi).sum(dim=1)
+        logp = policy.log_prob(a).sum(dim=1)
+        return pi, logp, logp_pi, mu
+
+class ActorCritic(nn.Module):
+    def __init__(self, o, a, hdims=[64,64], actv=nn.ReLU(), output_actv=None, policy=None):
+        super(ActorCritic,self).__init__()
+
+        self.policy = GaussianPolicy(o, a, hdims, actv, output_actv)
+        self.vf_mlp = MLP(o_dim=o.shape[0],hdims=hdims,actv=actv,output_actv=output_actv)
+
+    def forward(self, x, a):
+        pi, logp, logp_pi, mu = self.policy(x, a)
+        v = self.vf_mlp(x)
+        return pi, logp, logp_pi, mu, v
