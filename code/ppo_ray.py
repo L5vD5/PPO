@@ -181,13 +181,14 @@ class RayRolloutWorkerClass(object):
             self.buf.store(self.o, a, r, v_t, logp_t)
             # Update obs (critical!)
             self.o = o2
+
             if d:
                 self.buf.finish_path(last_val=0.0)
                 self.o = self.env.reset()  # reset when done
 
         last_val = self.model.vf_mlp(torch.Tensor(self.o.reshape(1, -1))).item()
-
         self.buf.finish_path(last_val)
+
         return self.buf.get()
 
 # Initialize PyBullet Ant Environment
@@ -204,7 +205,7 @@ ray.init(num_cpus=config.n_cpu,
 
 R = RolloutWorkerClass(seed=0)
 workers = [RayRolloutWorkerClass.remote(worker_id=i,ep_len_rollout=config.ep_len_rollout)
-           for i in range(config.n_workers)]
+           for i in range(int(config.n_workers))]
 print ("RAY initialized with [%d] cpus and [%d] workers."%
        (config.n_cpu,config.n_workers))
 
@@ -245,12 +246,13 @@ for t in range(int(config.total_steps)):
             logp_bufs = np.concatenate((logp_bufs, logp_buf), axis=0)
 
     n_val_total = obs_bufs.shape[0]
-    for pi_iter in range(config.train_pi_iters):
+    for pi_iter in range(int(config.train_pi_iters)):
         rand_idx = np.random.permutation(n_val_total)[:config.batch_size]
         buf_batches = [obs_bufs[rand_idx], act_bufs[rand_idx], adv_bufs[rand_idx],
                        ret_bufs[rand_idx], logp_bufs[rand_idx]]
 
         obs, act, adv, ret, logp = [torch.Tensor(x) for x in buf_batches]
+        ent = (-logp).mean()
 
         obs = torch.FloatTensor(obs).to(device)
         act = torch.FloatTensor(act).to(device)
@@ -270,22 +272,27 @@ for t in range(int(config.total_steps)):
         pi_loss.backward()
         R.train_pi.step()
 
-        ent = (-logp).mean()
-
         # a sample estimate for KL-divergence
-        kl = (logp_a_old - logp_a).mean()
+        kl = torch.mean(logp_a_old - logp_a)
         if kl > 1.5 * config.target_kl:
-            # print ("  pi_iter:[%d] kl(%.3f) is higher than 1.5x(%.3f)"%(pi_iter,kl,target_kl))
+            #print("  pi_iter:[%d] kl(%.3f) is higher than 1.5x(%.3f)"%(pi_iter,kl,config.target_kl))
             break
 
     # Value gradient step
-    for _ in range(config.train_v_iters):
+    for _ in range(int(config.train_v_iters)):
+        rand_idx = np.random.permutation(n_val_total)[:config.batch_size]
+        buf_batches = [obs_bufs[rand_idx], act_bufs[rand_idx], adv_bufs[rand_idx],
+                       ret_bufs[rand_idx], logp_bufs[rand_idx]]
+
+        obs, act, adv, ret, logp = [torch.Tensor(x) for x in buf_batches]
+
         v = R.model.vf_mlp(obs).squeeze()
         v_loss = F.mse_loss(v, ret)
 
         R.train_v.zero_grad()
         v_loss.backward()
         R.train_v.step()
+
     sec_update = time.time() - t_start  # toc
 
     # Print
@@ -294,7 +301,6 @@ for t in range(int(config.total_steps)):
               (t + 1, config.total_steps, sec_rollout, pi_iter, config.train_pi_iters, sec_update, kl, config.target_kl))
         print("   pi_loss:[%.4f], entropy:[%.4f]" %
               (pi_loss, ent))
-
 
     # Evaluate
     if (t == 0) or (((t + 1) % config.evaluate_every) == 0):
